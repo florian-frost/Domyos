@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Domyos EL540 test</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 16px; }
+  button { font-size: 18px; padding: 12px 16px; margin: 4px 4px 4px 0; border: 0; border-radius: 8px; background: #2a6df4; color: #fff; }
+  button:disabled { background: #444; }
+  .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 12px 0; }
+  .m { background: #1d1d1d; border-radius: 8px; padding: 10px; }
+  .m b { display: block; font-size: 28px; }
+  .m span { font-size: 12px; color: #999; }
+  #log { font: 11px/1.4 monospace; background: #000; padding: 8px; height: 40vh; overflow: auto; white-space: pre-wrap; border-radius: 8px; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  #res { font-size: 28px; min-width: 40px; text-align: center; }
+</style>
+</head>
+<body>
+<button id="connect">Conectar</button>
+<button id="disconnect" disabled>Desconectar</button>
+
+<div class="grid">
+  <div class="m"><b id="rpm">-</b><span>RPM</span></div>
+  <div class="m"><b id="speed">-</b><span>km/h</span></div>
+  <div class="m"><b id="resist">-</b><span>Resistencia (consola)</span></div>
+  <div class="m"><b id="dist">-</b><span>km</span></div>
+  <div class="m"><b id="kcal">-</b><span>kcal</span></div>
+  <div class="m"><b id="hr">-</b><span>BPM</span></div>
+</div>
+
+<div class="row">
+  <button id="minus" disabled>−</button>
+  <div id="res">4</div>
+  <button id="plus" disabled>+</button>
+  <button id="send" disabled>Enviar resistencia</button>
+</div>
+
+<p><label><input type="checkbox" id="showNoop"> Mostrar polls en el log</label></p>
+<div id="log"></div>
+
+<script>
+// Protocol taken from qdomyos-zwift: src/devices/domyoselliptical/domyoselliptical.cpp
+const SERVICE = '49535343-fe7d-4ae5-8fa9-9fafd205e455';
+const NOTIFY  = '49535343-1e4d-4bd9-ba61-23c647249616';
+const WRITE   = '49535343-8841-43f4-a8d4-ecbe34729bb3';
+
+const h = a => a.map(b => b.toString(16).padStart(2, '0')).join(' ');
+const $ = id => document.getElementById(id);
+const logEl = $('log');
+function log(msg) {
+  const t = new Date().toISOString().substr(11, 12);
+  logEl.textContent += `${t} ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// Init sequence (btinit_changyow, startTape=false). Fragments are sent in this order;
+// the >20-byte frames are already split the way QZ splits them.
+const INIT = [
+  [0xf0,0xc8,0x01,0xb9],
+  [0xf0,0xc9,0xb9],
+  [0xf0,0xa3,0x93],
+  [0xf0,0xa4,0x94],
+  [0xf0,0xa5,0x95],
+  [0xf0,0xab,0x9b],
+  [0xf0,0xc4,0x03,0xb7],
+  [0xf0,0xad,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x01,0xff],
+  [0xff,0xff,0x8b],                                    // BT icon on
+  [0xf0,0xcb,0x02,0x00,0x08,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x01,0x00],
+  [0x00,0x01,0xff,0xff,0xff,0xff,0xb6],                // "BT" word
+  [0xf0,0xad,0xff,0xff,0x00,0x05,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x00,0x00,0xff,0xff,0xff,0x01,0xff],
+];
+const NOOP = [0xf0, 0xac, 0x9c];
+
+function withChecksum(arr) {
+  let s = 0;
+  for (let i = 0; i < arr.length - 1; i++) s += arr[i];
+  arr[arr.length - 1] = s & 0xff;
+  return arr;
+}
+function resistanceFrame(level) {
+  const f = [0xf0,0xad,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+             0xff,0xff,0xff,0xff,0xff,0x00,0x01,0xff,0xff,0xff,0x00];
+  f[10] = level;
+  return withChecksum(f);
+}
+
+let device, writeChar, notifyChar, pollTimer, queue = Promise.resolve(), rxBuf = [];
+
+function write(bytes, label, quiet) {
+  // Serialize writes; split at 20 bytes (default BLE payload).
+  queue = queue.then(async () => {
+    for (let i = 0; i < bytes.length; i += 20) {
+      const part = bytes.slice(i, i + 20);
+      await writeChar.writeValueWithoutResponse(new Uint8Array(part));
+    }
+    if (!quiet) log(`>> ${label}: ${h(bytes)}`);
+  }).catch(e => log(`!! write ${label}: ${e.message}`));
+  return queue;
+}
+
+function onNotify(e) {
+  const v = Array.from(new Uint8Array(e.target.value.buffer));
+  const noop = !$('showNoop').checked;
+  if (v[0] === 0xf0) rxBuf = v.slice(); else rxBuf = rxBuf.concat(v);
+  if (!noop || rxBuf.length !== 26) log(`<< ${h(v)}`);
+  if (rxBuf.length === 26) parse(rxBuf);
+}
+
+function parse(p) {
+  const u16 = (a, b) => (p[a] << 8) | p[b];
+  $('speed').textContent  = (u16(6, 7) / 10).toFixed(1);
+  $('rpm').textContent    = p[9];
+  $('kcal').textContent   = u16(10, 11);
+  $('dist').textContent   = (u16(12, 13) / 10).toFixed(1);
+  $('resist').textContent = p[14];
+  $('hr').textContent     = p[18];
+  if ($('showNoop').checked) log(`== frame: ${h(p)}`);
+}
+
+async function connect() {
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'Domyos' }, { namePrefix: 'DOMYOS' }],
+      optionalServices: [SERVICE],
+    });
+    device.addEventListener('gattserverdisconnected', onDisconnected);
+    log(`Conectando a ${device.name}…`);
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE);
+    notifyChar = await svc.getCharacteristic(NOTIFY);
+    writeChar  = await svc.getCharacteristic(WRITE);
+    notifyChar.addEventListener('characteristicvaluechanged', onNotify);
+    await notifyChar.startNotifications();
+    log('Notificaciones activas. Enviando init…');
+    for (const [i, f] of INIT.entries()) await write(f, `init${i + 1}`);
+    pollTimer = setInterval(() => write(NOOP, 'noop', true), 300);
+    try { await navigator.wakeLock?.request('screen'); } catch {}
+    setUi(true);
+  } catch (e) {
+    log(`!! ${e.message}`);
+  }
+}
+
+function onDisconnected() {
+  clearInterval(pollTimer);
+  log('Desconectado (¿dejaste de pedalear?)');
+  setUi(false);
+}
+
+function setUi(on) {
+  $('connect').disabled = on;
+  ['disconnect', 'minus', 'plus', 'send'].forEach(id => $(id).disabled = !on);
+}
+
+let level = 4;
+$('minus').onclick = () => { level = Math.max(1, level - 1); $('res').textContent = level; };
+$('plus').onclick  = () => { level = Math.min(15, level + 1); $('res').textContent = level; };
+$('send').onclick  = () => write(resistanceFrame(level), `resistencia ${level}`);
+$('connect').onclick = connect;
+$('disconnect').onclick = () => device?.gatt.disconnect();
+
+if (!navigator.bluetooth) log('!! Este navegador no tiene Web Bluetooth (usa Chrome en Android, con HTTPS).');
+</script>
+</body>
+</html>
